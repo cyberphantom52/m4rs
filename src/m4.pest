@@ -1,1 +1,31 @@
-// TODO
+NEWLINE = _{ "\n" | "\r\n" | "\r" }
+WHITESPACE = { (" " | "\t" | "\n" | "\r" | "\x0C" | "\x0B")+ }
+COMMENT = _{ ("#" | "dnl") ~ (!NEWLINE ~ ANY)* ~ NEWLINE }
+
+// Parenthesis balancing
+paren_inner = _{ paren_group | !("(" | ")") ~ ANY }
+paren_group = ${ "(" ~ paren_inner* ~ ")" }
+
+// Quotes balancing
+quoted_inner = _{ quoted_group | !("`" | "'") ~ ANY }
+quoted_group= ${ "`" ~ quoted_inner* ~ "'" }
+
+// Identifiers
+name = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// Positional args
+positional_argument = ${ "$" ~ ASCII_DIGIT+ }
+
+// Arguments (comma-separated bodies)
+argument = ${ (paren_group | (!(","| ")") ~ (token | WHITESPACE)))* }
+argument_list = { argument? ~ ("," ~ WHITESPACE? ~ argument?)* }
+arguments = { "(" ~ argument_list? ~ ")" }
+
+// Macro call
+macrocall = ${ name ~ arguments? }
+
+// Top-level tokens - includes whitespace as text
+literal = ${ (!(WHITESPACE | "`" | "'" | positional_argument) ~ ANY)+ }
+token = { macrocall | positional_argument | quoted_group | literal }
+
+file = { SOI ~ token* ~ EOI }
