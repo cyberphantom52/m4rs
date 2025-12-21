@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use pest::{Parser, iterators::Pairs};
 use pest_derive::Parser;
 
@@ -31,7 +33,7 @@ impl M4Parser {
             }
             Rule::macrocall => Self::parse_macrocall(pair).map(Token::MacroCall),
             Rule::quoted_group => Self::parse_group(pair).map(Token::Group),
-            Rule::literal | Rule::WHITESPACE => Some(Token::Literal(pair.as_str())),
+            Rule::literal | Rule::WHITESPACE => Some(Token::Literal(Cow::Borrowed(pair.as_str()))),
             _ => None,
         }
     }
@@ -39,7 +41,7 @@ impl M4Parser {
     fn parse_macrocall(pair: pest::iterators::Pair<Rule>) -> Option<MacroCall> {
         let mut inner = pair.into_inner();
 
-        let name = inner.next().map(|p| p.as_str())?;
+        let name = inner.next().map(|p| Cow::Borrowed(p.as_str()))?;
         let args = inner.next().map(Self::parse_arguments).unwrap_or_default();
 
         Some(MacroCall { name, args })
@@ -68,7 +70,10 @@ impl M4Parser {
         }
 
         // Multiple tokens -> wrap in a Group
-        Some(Token::Group(Group { lexeme, tokens }))
+        Some(Token::Group(Group {
+            lexeme: Cow::Borrowed(lexeme),
+            tokens,
+        }))
     }
 
     fn parse_group(pair: pest::iterators::Pair<Rule>) -> Option<Group> {
@@ -79,7 +84,10 @@ impl M4Parser {
             .unwrap_or("");
 
         match M4Parser::parse_input(content) {
-            Ok(tokens) => Some(Group { lexeme, tokens }),
+            Ok(tokens) => Some(Group {
+                lexeme: Cow::Borrowed(lexeme),
+                tokens,
+            }),
             Err(_) => None,
         }
     }
@@ -121,15 +129,15 @@ mod tests {
                 assert_eq!(
                     args[1],
                     Token::Group(Group {
-                        lexeme: "`Hello $1!'",
+                        lexeme: Cow::Borrowed("`Hello $1!'"),
                         tokens: vec![
                             Token::MacroCall(MacroCall {
-                                name: "Hello",
+                                name: Cow::Borrowed("Hello"),
                                 args: vec![]
                             }),
-                            Token::Literal(" "),
+                            Token::Literal(Cow::Borrowed(" ")),
                             Token::Positional(1),
-                            Token::Literal("!"),
+                            Token::Literal(Cow::Borrowed("!")),
                         ],
                     })
                 );
@@ -210,9 +218,9 @@ mod tests {
                 assert!(matches!(
                     &args[2],
                     Token::Group(Group {
-                        lexeme: "hello world",
+                        lexeme,
                         ..
-                    })
+                    }) if lexeme == "hello world"
                 ));
             }
             _ => panic!("Expected MacroCall token for ifelse"),
