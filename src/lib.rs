@@ -1,14 +1,11 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+/// Top-level parsed token
+#[derive(Debug, Clone, PartialEq)]
+pub enum Token {
+    /// Macro call
+    MacroCall { name: String, args: Vec<Vec<Token>> },
+    /// Positional argument reference: $1, $2, etc.
+    Positional(usize),
+    /// Literal text (whitespace, punctuation, quoted content, etc.)
+    /// Empty arguments are represented as Literal("")
+    Literal(String),
 }
