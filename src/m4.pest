@@ -1,5 +1,5 @@
 WHITESPACE =  { (" " | "\t" | "\n" | "\r" | "\x0C" | "\x0B")+ }
-COMMENT    = _{ ("#" | "dnl") ~ (!NEWLINE ~ ANY)* ~ NEWLINE }
+COMMENT    = _{ ("dnl" ~ (!NEWLINE ~ ANY)* ~ NEWLINE) | ("#" ~ (!NEWLINE ~ ANY)*) }
 
 // Parenthesis balancing
 paren_inner = _{ paren_group | !("(" | ")") ~ ANY }
