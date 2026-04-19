@@ -162,8 +162,9 @@ impl Expander {
                     // Expand the body with the expanded arguments
                     let expanded =
                         self.expand_tokens_with_depth(&body, &expanded_args, depth + 1)?;
-                    // Rescan: parse and expand the result
-                    self.rescan(&expanded, depth + 1)
+                    // Rescan: parse and expand the result while preserving the
+                    // caller's argument context for delayed positional arguments.
+                    self.rescan(&expanded, parent_args, depth + 1)
                 } else {
                     // Unknown macro - output as-is
                     if expanded_args.is_empty() {
@@ -334,14 +335,14 @@ impl Expander {
     }
 
     /// Rescan: parse the expanded text and expand again
-    fn rescan(&mut self, text: &str, depth: usize) -> Result<String, String> {
+    fn rescan(&mut self, text: &str, args: &[String], depth: usize) -> Result<String, String> {
         if depth > self.max_depth {
             return Err("Maximum expansion depth exceeded".to_string());
         }
 
         // Try to parse - if it fails, just return the text as-is
         match M4Parser::parse_input(text) {
-            Ok(tokens) => self.expand_tokens_with_depth(&tokens, &[], depth),
+            Ok(tokens) => self.expand_tokens_with_depth(&tokens, args, depth),
             Err(_) => Ok(text.to_string()),
         }
     }
@@ -513,6 +514,21 @@ mod tests {
 
         let result = expander.expand("ifdef(`UNDEFINED', `yes', `no')").unwrap();
         assert_eq!(result, "no");
+    }
+
+    #[test]
+    fn test_rescan_preserves_parent_args() {
+        let mut registry = MacroRegistry::new();
+        registry
+            .load(
+                r#"define(`pass_through', `$1')
+define(`outer', `pass_through(`$1')')"#,
+            )
+            .unwrap();
+
+        let mut expander = Expander::new(registry);
+        let result = expander.expand("outer(value)").unwrap();
+        assert_eq!(result, "value");
     }
 
     #[test]
