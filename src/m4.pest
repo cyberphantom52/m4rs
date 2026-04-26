@@ -9,6 +9,10 @@ paren_group = ${ "(" ~ paren_inner* ~ ")" }
 quoted_inner = _{ quoted_group | !("`" | "'") ~ ANY }
 quoted_group = ${ "`" ~ quoted_inner* ~ "'" }
 
+// Brace balancing
+brace_inner = _{ brace_group | !("{" | "}") ~ ANY }
+brace_group = ${ "{" ~ brace_inner* ~ "}" }
+
 // Identifiers
 name = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
@@ -24,7 +28,7 @@ arguments     =  { "(" ~ argument_list? ~ ")" }
 macrocall = ${ name ~ arguments? }
 
 // Top-level tokens - includes whitespace as text
-literal = ${ (!(WHITESPACE | "`" | "'" | positional_argument) ~ ANY)+ }
-token   =  { macrocall | positional_argument | quoted_group | literal }
+literal = ${ (!("{" | "}" | WHITESPACE | "`" | "'" | positional_argument | ")") ~ ANY)+ }
+token   =  { macrocall | positional_argument | quoted_group | brace_group | literal }
 
 file = { SOI ~ token* ~ EOI }

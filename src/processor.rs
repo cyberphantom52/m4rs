@@ -532,6 +532,26 @@ define(`outer', `pass_through(`$1')')"#,
     }
 
     #[test]
+    fn test_brace_set_macro_argument() {
+        let mut registry = MacroRegistry::new();
+        registry
+            .load("define(`get_prop', `allow $1 $2:file { getattr open read map };')")
+            .unwrap();
+
+        let mut expander = Expander::new(registry);
+        let result = expander
+            .expand(
+                "get_prop(hal_cryptoeng_oplus, { boot_status_prop serialno_prop vendor_nw_exported_system_prop vendor_oplus_overseas_prop vendor_tee_listener_prop })",
+            )
+            .unwrap();
+
+        assert_eq!(
+            result,
+            "allow hal_cryptoeng_oplus { boot_status_prop serialno_prop vendor_nw_exported_system_prop vendor_oplus_overseas_prop vendor_tee_listener_prop }:file { getattr open read map };"
+        );
+    }
+
+    #[test]
     fn test_quoted_string() {
         let mut registry = MacroRegistry::new();
         registry.define(

@@ -32,7 +32,7 @@ impl M4Parser {
                 Some(Token::Positional(num))
             }
             Rule::macrocall => Self::parse_macrocall(pair).map(Token::MacroCall),
-            Rule::quoted_group => Self::parse_group(pair).map(Token::Group),
+            Rule::quoted_group | Rule::brace_group => Self::parse_group(pair).map(Token::Group),
             Rule::literal | Rule::WHITESPACE => Some(Token::Literal(Cow::Borrowed(pair.as_str()))),
             _ => None,
         }
@@ -78,16 +78,36 @@ impl M4Parser {
 
     fn parse_group(pair: pest::iterators::Pair<Rule>) -> Option<Group> {
         let lexeme = pair.as_str();
-        let content = lexeme
-            .strip_prefix('`')
-            .and_then(|t| t.strip_suffix('\''))
-            .unwrap_or("");
+        let (content, keep_delimiters) = match pair.as_rule() {
+            Rule::quoted_group => (
+                lexeme
+                    .strip_prefix('`')
+                    .and_then(|t| t.strip_suffix('\''))
+                    .unwrap_or(""),
+                false,
+            ),
+            Rule::brace_group => (
+                lexeme
+                    .strip_prefix('{')
+                    .and_then(|t| t.strip_suffix('}'))
+                    .unwrap_or(""),
+                true,
+            ),
+            _ => ("", false),
+        };
 
         match M4Parser::parse_input(content) {
-            Ok(tokens) => Some(Group {
-                lexeme: Cow::Borrowed(lexeme),
-                tokens,
-            }),
+            Ok(mut tokens) => {
+                if keep_delimiters {
+                    tokens.insert(0, Token::Literal(Cow::Borrowed("{")));
+                    tokens.push(Token::Literal(Cow::Borrowed("}")));
+                }
+
+                Some(Group {
+                    lexeme: Cow::Borrowed(lexeme),
+                    tokens,
+                })
+            }
             Err(_) => None,
         }
     }
