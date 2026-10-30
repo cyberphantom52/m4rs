@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, Read};
 
 use crate::ast::*;
+use crate::error::M4Error;
 use crate::parser::M4Parser;
 
 /// Registry of macro definitions (stores raw, unexpanded tokens)
@@ -15,7 +16,7 @@ impl MacroRegistry {
 
     /// Load macro definitions from M4 source text.
     /// Expands the source - define() calls populate the registry as a side effect.
-    pub fn load(&mut self, source: &str) -> Result<(), String> {
+    pub fn load(&mut self, source: &str) -> Result<(), M4Error> {
         let mut expander = Expander::new(self.clone());
         expander.expand(source)?;
         *self = expander.into_registry();
@@ -23,9 +24,11 @@ impl MacroRegistry {
     }
 
     /// Load macro definitions from a file
-    pub fn load_file(&mut self, path: &str) -> Result<(), String> {
-        let source =
-            std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
+    pub fn load_file(&mut self, path: &str) -> Result<(), M4Error> {
+        let source = std::fs::read_to_string(path).map_err(|source| M4Error::Io {
+            path: path.to_string(),
+            source,
+        })?;
         self.load(&source)
     }
 
@@ -64,13 +67,13 @@ impl Expander {
     }
 
     /// Expand all macros in the input text (main entry point)
-    pub fn expand(&mut self, input: &str) -> Result<String, String> {
-        let tokens = M4Parser::parse_input(input).map_err(|e| e.to_string())?;
+    pub fn expand(&mut self, input: &str) -> Result<String, M4Error> {
+        let tokens = M4Parser::parse_input(input)?;
         self.expand_tokens(&tokens)
     }
 
     /// Expand a list of tokens
-    pub fn expand_tokens(&mut self, tokens: &[Token]) -> Result<String, String> {
+    pub fn expand_tokens(&mut self, tokens: &[Token]) -> Result<String, M4Error> {
         self.expand_tokens_with_depth(tokens, &[], 0)
     }
 
@@ -79,9 +82,9 @@ impl Expander {
         tokens: &[Token],
         args: &[String],
         depth: usize,
-    ) -> Result<String, String> {
+    ) -> Result<String, M4Error> {
         if depth > self.max_depth {
-            return Err("Maximum expansion depth exceeded".to_string());
+            return Err(M4Error::MaxDepthExceeded(self.max_depth));
         }
 
         let mut result = String::new();
@@ -97,7 +100,7 @@ impl Expander {
         token: &Token,
         args: &[String],
         depth: usize,
-    ) -> Result<String, String> {
+    ) -> Result<String, M4Error> {
         match token {
             Token::MacroCall(call) => self.expand_macro_call(call, args, depth),
             Token::Positional(n) => {
@@ -129,7 +132,7 @@ impl Expander {
         call: &MacroCall,
         parent_args: &[String],
         depth: usize,
-    ) -> Result<String, String> {
+    ) -> Result<String, M4Error> {
         let name = call.name.as_ref();
 
         // Handle builtin macros by name
@@ -189,7 +192,7 @@ impl Expander {
         args: &[Token],
         parent_args: &[String],
         depth: usize,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<String>, M4Error> {
         let mut result = Vec::with_capacity(args.len());
         for arg in args {
             result.push(self.expand_argument(arg, parent_args, depth)?);
@@ -203,7 +206,7 @@ impl Expander {
         arg: &Token,
         parent_args: &[String],
         depth: usize,
-    ) -> Result<String, String> {
+    ) -> Result<String, M4Error> {
         match arg {
             Token::MacroCall(call) => {
                 // Check if this is a defined macro - if so, descend into its definition
@@ -237,7 +240,7 @@ impl Expander {
     }
 
     /// Extract text content from a token (for getting macro names, comparison values, etc.)
-    fn extract_text(&self, token: &Token, parent_args: &[String]) -> Result<String, String> {
+    fn extract_text(&self, token: &Token, parent_args: &[String]) -> Result<String, M4Error> {
         match token {
             Token::Literal(s) => Ok(s.to_string()),
             Token::Positional(n) => {
@@ -280,7 +283,7 @@ impl Expander {
         args: &[Token],
         parent_args: &[String],
         depth: usize,
-    ) -> Result<String, String> {
+    ) -> Result<String, M4Error> {
         // ifelse(a, b, then, d, e, then2, ..., else)
         // Process in groups of 3
         let mut i = 0;
@@ -309,7 +312,7 @@ impl Expander {
         args: &[Token],
         parent_args: &[String],
         depth: usize,
-    ) -> Result<String, String> {
+    ) -> Result<String, M4Error> {
         // ifdef(name, then, else?)
         if args.is_empty() {
             return Ok(String::new());
@@ -335,9 +338,9 @@ impl Expander {
     }
 
     /// Rescan: parse the expanded text and expand again
-    fn rescan(&mut self, text: &str, args: &[String], depth: usize) -> Result<String, String> {
+    fn rescan(&mut self, text: &str, args: &[String], depth: usize) -> Result<String, M4Error> {
         if depth > self.max_depth {
-            return Err("Maximum expansion depth exceeded".to_string());
+            return Err(M4Error::MaxDepthExceeded(self.max_depth));
         }
 
         // Try to parse - if it fails, just return the text as-is
@@ -654,5 +657,30 @@ world"#;
         let mut expander = Expander::new(registry);
         let result = expander.expand("feature_impl").unwrap();
         assert_eq!(result, "FEATURE_CODE");
+    }
+
+    #[test]
+    fn test_error_max_depth() {
+        let mut registry = MacroRegistry::new();
+        registry.load("define(`loop', `loop')").unwrap();
+
+        let mut expander = Expander::new(registry);
+        let err = expander.expand("loop").unwrap_err();
+        assert!(matches!(err, M4Error::MaxDepthExceeded(100)));
+    }
+
+    #[test]
+    fn test_error_parse() {
+        let mut expander = Expander::new(MacroRegistry::new());
+        let err = expander.expand("foo)").unwrap_err();
+        assert!(matches!(err, M4Error::Parse(_)));
+    }
+
+    #[test]
+    fn test_error_load_missing_file() {
+        let mut registry = MacroRegistry::new();
+        let err = registry.load_file("does/not/exist.m4").unwrap_err();
+        assert!(matches!(&err, M4Error::Io { path, .. } if path == "does/not/exist.m4"));
+        assert!(std::error::Error::source(&err).is_some());
     }
 }
