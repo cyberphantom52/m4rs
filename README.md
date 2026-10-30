@@ -1,13 +1,17 @@
 # m4rs
 
-A Rust implementation of an M4 macro processor with support for recursive expansion, positional arguments, and built-in macros.
+A Rust implementation of an M4 macro processor following GNU m4's expansion rules.
 
 ## Features
 
-- **M4-like parsing** using [Pest](https://pest.rs/) PEG grammar (subset of M4 features)
-- **Recursive macro expansion** with rescan behavior
+- **GNU m4 semantics**: a streaming expander with a pushback input stack, so expansions are rescanned, arguments are expanded as they are collected, and macro names are recognized anywhere in the text (after `:` or `-`, inside `0x...-NAME`)
+- **Builtins**: `define`, `undefine`, `ifdef`, `ifelse` (with chained conditions), `eval` (32-bit integer arithmetic with C operators and `**`), `incr`, `decr`, `len`, `shift` and `dnl`, plus `$0`-`$N`, `$#`, `$*` and `$@`
 - **Streaming expansion** via `ExpandingReader` implementing `std::io::Read`
-- **Zero-copy parsing** with `Cow<str>` for efficient string handling
+- **Bounded**: GNU m4's nesting limit of 1024 pending calls, kept on the heap rather than the call stack, and a rescan-depth limit that turns infinite recursion into an error
+
+Quoting uses `` ` `` and `'`; comments start with `#` and pass through unexpanded. `changequote`, `changecom`, `divert`, `include` and the other GNU builtins are not implemented.
+
+Unlike GNU m4, a malformed number in `eval`, `incr` or `decr` (including division by zero) is an error rather than a warning with empty output.
 
 ## Usage
 
@@ -61,14 +65,12 @@ reader.read_to_string(&mut output).expect("Failed to expand");
 
 ## Architecture
 
-The library is organized into three main modules:
-
 | Module | Description |
 |--------|-------------|
-| `ast` | Token types: `Token`, `MacroCall`, `Group` with `Cow<str>` for flexible ownership |
-| `parser` | Pest-based parser that converts M4 source into an AST |
-| `processor` | `MacroRegistry` for storing definitions and `Expander` for recursive expansion |
+| `processor` | `MacroRegistry` for definitions, `Expander` and `ExpandingReader` for expansion |
+| `error` | `M4Error` |
 
+Expansion output has been checked against GNU m4 on the policy sources of AOSP's `system/sepolicy`, with identical results.
 
 ## Contributing
 

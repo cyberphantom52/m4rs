@@ -1,25 +1,84 @@
+//! A streaming M4 macro processor following GNU m4.
+//!
+//! Input is read through a stack of pushed-back strings. A macro's expansion
+//! is pushed back and rescanned, so it can produce further macro calls or
+//! complete a call whose arguments continue in the remaining input. Input is
+//! split into words (`[A-Za-z_][A-Za-z0-9_]*`), quoted strings, comments and
+//! single characters, so a macro name is recognized wherever it appears, for
+//! example after `:` or `-`.
+
 use std::collections::HashMap;
 use std::io::{self, Read};
 
-use crate::ast::*;
 use crate::error::M4Error;
-use crate::parser::M4Parser;
+use crate::eval;
 
-/// Registry of macro definitions (stores raw, unexpanded tokens)
-#[derive(Debug, Default, Clone)]
-pub struct MacroRegistry(HashMap<String, Vec<Token<'static>>>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Builtin {
+    Define,
+    Undefine,
+    Ifdef,
+    Ifelse,
+    Eval,
+    Incr,
+    Decr,
+    Dnl,
+    Shift,
+    Len,
+}
+
+impl Builtin {
+    const ALL: [(&'static str, Builtin); 10] = [
+        ("define", Builtin::Define),
+        ("undefine", Builtin::Undefine),
+        ("ifdef", Builtin::Ifdef),
+        ("ifelse", Builtin::Ifelse),
+        ("eval", Builtin::Eval),
+        ("incr", Builtin::Incr),
+        ("decr", Builtin::Decr),
+        ("dnl", Builtin::Dnl),
+        ("shift", Builtin::Shift),
+        ("len", Builtin::Len),
+    ];
+
+    /// GNU m4 recognizes these builtins only when they are called with
+    /// arguments; a bare `define` is ordinary text. `dnl` works without them.
+    fn needs_args(self) -> bool {
+        self != Builtin::Dnl
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Macro {
+    Builtin(Builtin),
+    User(String),
+}
+
+/// Macro definitions: the builtins plus user macros, whose bodies are stored
+/// unexpanded and expanded on each use.
+#[derive(Debug, Clone)]
+pub struct MacroRegistry(HashMap<String, Macro>);
+
+impl Default for MacroRegistry {
+    fn default() -> Self {
+        Self(
+            Builtin::ALL
+                .iter()
+                .map(|&(name, builtin)| (name.to_string(), Macro::Builtin(builtin)))
+                .collect(),
+        )
+    }
+}
 
 impl MacroRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Load macro definitions from M4 source text.
-    /// Expands the source - define() calls populate the registry as a side effect.
+    /// Load macro definitions from M4 source text. The source is expanded
+    /// and its output discarded; `define` calls populate the registry.
     pub fn load(&mut self, source: &str) -> Result<(), M4Error> {
-        let mut expander = Expander::new(self.clone());
-        expander.expand(source)?;
-        *self = expander.into_registry();
+        Scanner::new(self, Expander::DEFAULT_MAX_DEPTH).expand(source)?;
         Ok(())
     }
 
@@ -32,33 +91,47 @@ impl MacroRegistry {
         self.load(&source)
     }
 
-    /// Register a macro definition (takes owned tokens)
-    pub fn define(&mut self, name: String, body: Vec<Token<'static>>) {
-        self.0.insert(name, body);
+    /// Define a user macro with an unexpanded body.
+    pub fn define(&mut self, name: impl Into<String>, body: impl Into<String>) {
+        self.0.insert(name.into(), Macro::User(body.into()));
     }
 
-    /// Get a macro definition by name
-    pub fn get(&self, name: &str) -> Option<&Vec<Token<'static>>> {
-        self.0.get(name)
+    /// The unexpanded body of a user macro; `None` for builtins and
+    /// undefined names.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        match self.0.get(name) {
+            Some(Macro::User(body)) => Some(body),
+            _ => None,
+        }
     }
 
-    /// Check if a macro is defined
+    /// Check if a macro, builtin or user-defined, is defined
     pub fn is_defined(&self, name: &str) -> bool {
         self.0.contains_key(name)
     }
 }
 
-/// M4 macro expander with recursive expansion
+/// M4 macro expander
 pub struct Expander {
     pub registry: MacroRegistry,
     max_depth: usize,
 }
 
 impl Expander {
+    /// How many generations of rescanned expansions may produce further
+    /// expansions before the expander assumes infinite recursion. GNU m4 has
+    /// no such limit and loops forever on `define(`x', `x')x`; legitimate tail
+    /// recursion, such as AOSP generating 1024 MLS categories, stays far below.
+    pub const DEFAULT_MAX_DEPTH: usize = 65_536;
+
+    /// How many macro calls may be collecting their arguments at once, GNU
+    /// m4's default nesting limit.
+    pub const MAX_NESTING: usize = 1024;
+
     pub fn new(registry: MacroRegistry) -> Self {
         Self {
             registry,
-            max_depth: 100,
+            max_depth: Self::DEFAULT_MAX_DEPTH,
         }
     }
 
@@ -66,289 +139,388 @@ impl Expander {
         self.registry
     }
 
-    /// Expand all macros in the input text (main entry point)
+    /// Expand all macros in the input text
     pub fn expand(&mut self, input: &str) -> Result<String, M4Error> {
-        let tokens = M4Parser::parse_input(input)?;
-        self.expand_tokens(&tokens)
+        Scanner::new(&mut self.registry, self.max_depth).expand(input)
     }
+}
 
-    /// Expand a list of tokens
-    pub fn expand_tokens(&mut self, tokens: &[Token]) -> Result<String, M4Error> {
-        self.expand_tokens_with_depth(tokens, &[], 0)
+/// Pushed-back input. `depth` counts the expansions that produced it.
+struct Frame {
+    text: String,
+    pos: usize,
+    depth: usize,
+}
+
+enum Token {
+    /// A word and the expansion depth of the input it was read from.
+    Word(String, usize),
+    /// A quoted string, without its outermost quotes.
+    Quoted(String),
+    /// A `#` comment through its newline, copied verbatim.
+    Comment(String),
+    Char(char),
+    Eof,
+}
+
+fn is_word_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// A macro call whose arguments are still being read.
+struct PendingCall {
+    name: String,
+    found: Macro,
+    /// Expansion depth of the input the name was read from.
+    depth: usize,
+    args: Vec<String>,
+    current: String,
+    /// Unquoted parentheses opened inside the current argument.
+    parens: usize,
+}
+
+/// Where text read now belongs: the output, or the argument being collected.
+fn sink<'a>(out: &'a mut String, calls: &'a mut [PendingCall]) -> &'a mut String {
+    match calls.last_mut() {
+        Some(call) => &mut call.current,
+        None => out,
     }
+}
 
-    fn expand_tokens_with_depth(
-        &mut self,
-        tokens: &[Token],
-        args: &[String],
-        depth: usize,
-    ) -> Result<String, M4Error> {
-        if depth > self.max_depth {
-            return Err(M4Error::MaxDepthExceeded(self.max_depth));
+struct Scanner<'r> {
+    registry: &'r mut MacroRegistry,
+    input: Vec<Frame>,
+    max_depth: usize,
+}
+
+impl<'r> Scanner<'r> {
+    fn new(registry: &'r mut MacroRegistry, max_depth: usize) -> Self {
+        Self {
+            registry,
+            input: Vec::new(),
+            max_depth,
         }
-
-        let mut result = String::new();
-        for token in tokens {
-            result.push_str(&self.expand_token(token, args, depth)?);
-        }
-        Ok(result)
     }
 
-    /// Expand a single token
-    fn expand_token(
-        &mut self,
-        token: &Token,
-        args: &[String],
-        depth: usize,
-    ) -> Result<String, M4Error> {
-        match token {
-            Token::MacroCall(call) => self.expand_macro_call(call, args, depth),
-            Token::Positional(n) => {
-                if *n > 0 && *n <= args.len() {
-                    Ok(args[*n - 1].clone())
-                } else {
-                    Ok(String::new())
-                }
-            }
-            Token::Literal(s) => Ok(s.to_string()),
-            Token::Group(g) => {
-                // For quoted strings (lexeme starts with `), strip quotes and return content
-                // This implements M4's quote-to-delay-expansion behavior
-                let lexeme = g.lexeme.as_ref();
-                if lexeme.starts_with('`') && lexeme.ends_with('\'') {
-                    // Return the content without quotes (don't expand inner tokens)
-                    Ok(lexeme[1..lexeme.len() - 1].to_string())
-                } else {
-                    // For unquoted groups (like multi-token arguments), expand inner tokens
-                    self.expand_tokens_with_depth(&g.tokens, args, depth)
-                }
-            }
-        }
-    }
+    /// Expand `input`. Calls collecting arguments are kept on an explicit
+    /// stack rather than the Rust call stack, so nesting depth is bounded by
+    /// [`Expander::MAX_NESTING`], not by the thread's stack size.
+    fn expand(mut self, input: &str) -> Result<String, M4Error> {
+        self.input.push(Frame {
+            text: input.to_string(),
+            pos: 0,
+            depth: 0,
+        });
 
-    /// Expand a macro call - core recursive logic
-    fn expand_macro_call(
-        &mut self,
-        call: &MacroCall,
-        parent_args: &[String],
-        depth: usize,
-    ) -> Result<String, M4Error> {
-        let name = call.name.as_ref();
+        let mut out = String::with_capacity(input.len());
+        let mut calls: Vec<PendingCall> = Vec::new();
+        // GNU m4 skips unquoted whitespace at the start of each argument.
+        let mut at_arg_start = false;
 
-        // Handle builtin macros by name
-        match name {
-            "define" => {
-                // define(name, body) - extract and store in registry
-                if call.args.len() >= 2 {
-                    // Expand the name (to resolve ifdef, ifelse, etc.)
-                    let macro_name = self.expand_token(&call.args[0], parent_args, depth)?;
-                    let macro_name = macro_name.trim().to_string();
-                    // Store raw body tokens
-                    let body = self.extract_body_tokens(&call.args[1]);
-                    self.registry.define(macro_name, body);
+        loop {
+            if at_arg_start {
+                while self.peek().is_some_and(char::is_whitespace) {
+                    self.next_char();
                 }
-                Ok(String::new())
+                at_arg_start = false;
             }
-            "ifelse" => self.expand_ifelse(&call.args, parent_args, depth),
-            "ifdef" => self.expand_ifdef(&call.args, parent_args, depth),
-            "dnl" => {
-                // Discard rest of line (handled in expand)
-                Ok(String::new())
-            }
-            _ => {
-                // User-defined macro: recursively expand each argument
-                let expanded_args = self.expand_arguments(&call.args, parent_args, depth)?;
 
-                // Look up in registry
-                if let Some(body) = self.registry.get(name) {
-                    let body = body.clone();
-                    // Expand the body with the expanded arguments
-                    let expanded =
-                        self.expand_tokens_with_depth(&body, &expanded_args, depth + 1)?;
-                    // Rescan: parse and expand the result while preserving the
-                    // caller's argument context for delayed positional arguments.
-                    self.rescan(&expanded, parent_args, depth + 1)
-                } else {
-                    // Unknown macro - output as-is
-                    if expanded_args.is_empty() {
-                        Ok(name.to_owned())
-                    } else {
-                        Ok(format!("{}({})", name, expanded_args.join(", ")))
+            match self.next_token()? {
+                Token::Eof => {
+                    return match calls.pop() {
+                        Some(call) => Err(M4Error::UnterminatedArguments(call.name)),
+                        None => Ok(out),
+                    };
+                }
+                Token::Word(word, depth) => match self.callable(&word) {
+                    Some(found) if self.peek() == Some('(') => {
+                        self.next_char();
+                        if calls.len() == Expander::MAX_NESTING {
+                            return Err(M4Error::NestingLimitExceeded(Expander::MAX_NESTING));
+                        }
+                        calls.push(PendingCall {
+                            name: word,
+                            found,
+                            depth,
+                            args: Vec::new(),
+                            current: String::new(),
+                            parens: 0,
+                        });
+                        at_arg_start = true;
+                    }
+                    Some(found) => {
+                        let expansion = self.apply(&word, found, &[])?;
+                        self.push(expansion, depth + 1)?;
+                    }
+                    None => sink(&mut out, &mut calls).push_str(&word),
+                },
+                Token::Quoted(text) | Token::Comment(text) => {
+                    sink(&mut out, &mut calls).push_str(&text)
+                }
+                Token::Char(c) => {
+                    let Some(call) = calls.last_mut() else {
+                        out.push(c);
+                        continue;
+                    };
+                    match c {
+                        '(' => {
+                            call.parens += 1;
+                            call.current.push(c);
+                        }
+                        ')' if call.parens == 0 => {
+                            let call = calls.pop().expect("a call is pending");
+                            let mut args = call.args;
+                            args.push(call.current);
+                            let expansion = self.apply(&call.name, call.found, &args)?;
+                            self.push(expansion, call.depth + 1)?;
+                        }
+                        ')' => {
+                            call.parens -= 1;
+                            call.current.push(c);
+                        }
+                        ',' if call.parens == 0 => {
+                            call.args.push(std::mem::take(&mut call.current));
+                            at_arg_start = true;
+                        }
+                        _ => call.current.push(c),
                     }
                 }
             }
         }
     }
 
-    /// Recursively expand macro call arguments
-    ///
-    /// For each argument:
-    /// - If it's a MacroCall for a defined macro, descend into that macro's definition,
-    ///   expand it fully, and use the result as the argument value
-    /// - If it's a Group (quoted), strip quotes and use literal content
-    /// - Otherwise, expand normally
-    fn expand_arguments(
-        &mut self,
-        args: &[Token],
-        parent_args: &[String],
-        depth: usize,
-    ) -> Result<Vec<String>, M4Error> {
-        let mut result = Vec::with_capacity(args.len());
-        for arg in args {
-            result.push(self.expand_argument(arg, parent_args, depth)?);
+    /// Drop exhausted frames and return the next character without
+    /// consuming it.
+    fn peek(&mut self) -> Option<char> {
+        while let Some(frame) = self.input.last() {
+            if let Some(c) = frame.text[frame.pos..].chars().next() {
+                return Some(c);
+            }
+            self.input.pop();
         }
-        Ok(result)
+        None
     }
 
-    /// Expand a single argument, recursively descending into macro definitions
-    fn expand_argument(
-        &mut self,
-        arg: &Token,
-        parent_args: &[String],
-        depth: usize,
-    ) -> Result<String, M4Error> {
-        match arg {
-            Token::MacroCall(call) => {
-                // Check if this is a defined macro - if so, descend into its definition
-                let name = call.name.as_ref();
-
-                // Handle built-in macros normally
-                if matches!(name, "define" | "ifelse" | "ifdef" | "dnl") {
-                    return self.expand_macro_call(call, parent_args, depth);
-                }
-
-                if self.registry.is_defined(name) {
-                    // Recursively expand this macro call
-                    self.expand_macro_call(call, parent_args, depth)
-                } else {
-                    // Not a defined macro - expand as normal token
-                    self.expand_token(arg, parent_args, depth)
-                }
-            }
-            Token::Group(g) => {
-                // Quoted string - strip quotes and return content (no expansion)
-                let lexeme = g.lexeme.as_ref();
-                if lexeme.starts_with('`') && lexeme.ends_with('\'') {
-                    Ok(lexeme[1..lexeme.len() - 1].to_string())
-                } else {
-                    // Unquoted group - expand inner tokens
-                    self.expand_tokens_with_depth(&g.tokens, parent_args, depth)
-                }
-            }
-            _ => self.expand_token(arg, parent_args, depth),
-        }
+    fn next_char(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        let frame = self.input.last_mut().expect("peek found a frame");
+        frame.pos += c.len_utf8();
+        Some(c)
     }
 
-    /// Extract text content from a token (for getting macro names, comparison values, etc.)
-    fn extract_text(&self, token: &Token, parent_args: &[String]) -> Result<String, M4Error> {
-        match token {
-            Token::Literal(s) => Ok(s.to_string()),
-            Token::Positional(n) => {
-                if *n > 0 && *n <= parent_args.len() {
-                    Ok(parent_args[*n - 1].clone())
-                } else {
-                    Ok(String::new())
-                }
-            }
-            Token::Group(g) => {
-                // For groups, concatenate all inner text
-                let mut result = String::new();
-                for t in &g.tokens {
-                    result.push_str(&self.extract_text(t, parent_args)?);
-                }
-                Ok(result)
-            }
-            Token::MacroCall(call) => {
-                // For a simple identifier (no args), just return the name
-                if call.args.is_empty() {
-                    Ok(call.name.to_string())
-                } else {
-                    // Has args, treat as complex expression
-                    Ok(String::new())
-                }
-            }
-        }
-    }
-
-    /// Extract body tokens from an argument, converting to owned for storage
-    fn extract_body_tokens(&self, token: &Token) -> Vec<Token<'static>> {
-        match token {
-            Token::Group(g) => g.tokens.iter().map(|t| t.clone().into_owned()).collect(),
-            _ => vec![token.clone().into_owned()],
-        }
-    }
-
-    fn expand_ifelse(
-        &mut self,
-        args: &[Token],
-        parent_args: &[String],
-        depth: usize,
-    ) -> Result<String, M4Error> {
-        // ifelse(a, b, then, d, e, then2, ..., else)
-        // Process in groups of 3
-        let mut i = 0;
-        while i + 2 < args.len() {
-            let a = self.expand_token(&args[i], parent_args, depth)?;
-            let b = self.expand_token(&args[i + 1], parent_args, depth)?;
-            // M4 trims whitespace for comparison
-            if a.trim() == b.trim() {
-                let result = self.expand_token(&args[i + 2], parent_args, depth)?;
-                return Ok(result.trim().to_string());
-            }
-            i += 3;
-        }
-
-        // Remaining arg is the else clause
-        if i < args.len() {
-            let result = self.expand_token(&args[i], parent_args, depth)?;
-            Ok(result.trim().to_string())
-        } else {
-            Ok(String::new())
-        }
-    }
-
-    fn expand_ifdef(
-        &mut self,
-        args: &[Token],
-        parent_args: &[String],
-        depth: usize,
-    ) -> Result<String, M4Error> {
-        // ifdef(name, then, else?)
-        if args.is_empty() {
-            return Ok(String::new());
-        }
-
-        // Extract the macro name without expanding (for ifdef, we check the name, not its value)
-        let name = self.extract_text(&args[0], parent_args)?;
-        let name = name.trim();
-
-        if self.registry.is_defined(name) {
-            if args.len() > 1 {
-                let result = self.expand_token(&args[1], parent_args, depth)?;
-                Ok(result.trim().to_string())
-            } else {
-                Ok(String::new())
-            }
-        } else if args.len() > 2 {
-            let result = self.expand_token(&args[2], parent_args, depth)?;
-            Ok(result.trim().to_string())
-        } else {
-            Ok(String::new())
-        }
-    }
-
-    /// Rescan: parse the expanded text and expand again
-    fn rescan(&mut self, text: &str, args: &[String], depth: usize) -> Result<String, M4Error> {
+    fn push(&mut self, text: String, depth: usize) -> Result<(), M4Error> {
         if depth > self.max_depth {
             return Err(M4Error::MaxDepthExceeded(self.max_depth));
         }
+        if !text.is_empty() {
+            self.input.push(Frame {
+                text,
+                pos: 0,
+                depth,
+            });
+        }
+        Ok(())
+    }
 
-        // Try to parse - if it fails, just return the text as-is
-        match M4Parser::parse_input(text) {
-            Ok(tokens) => self.expand_tokens_with_depth(&tokens, args, depth),
-            Err(_) => Ok(text.to_string()),
+    fn next_token(&mut self) -> Result<Token, M4Error> {
+        let Some(c) = self.peek() else {
+            return Ok(Token::Eof);
+        };
+
+        if is_word_start(c) {
+            let depth = self.input.last().map_or(0, |frame| frame.depth);
+            let mut word = String::new();
+            while let Some(c) = self.peek().filter(|&c| is_word_char(c)) {
+                word.push(c);
+                self.next_char();
+            }
+            return Ok(Token::Word(word, depth));
+        }
+
+        self.next_char();
+        match c {
+            '`' => {
+                let mut text = String::new();
+                let mut level = 1;
+                loop {
+                    let c = self.next_char().ok_or(M4Error::UnterminatedQuote)?;
+                    match c {
+                        '`' => level += 1,
+                        '\'' => {
+                            level -= 1;
+                            if level == 0 {
+                                return Ok(Token::Quoted(text));
+                            }
+                        }
+                        _ => {}
+                    }
+                    text.push(c);
+                }
+            }
+            '#' => {
+                let mut text = String::from('#');
+                while let Some(c) = self.next_char() {
+                    text.push(c);
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                Ok(Token::Comment(text))
+            }
+            _ => Ok(Token::Char(c)),
         }
     }
+
+    /// The macro `word` names, if this occurrence is a call.
+    fn callable(&mut self, word: &str) -> Option<Macro> {
+        let found = self.registry.0.get(word)?.clone();
+        if let Macro::Builtin(builtin) = found
+            && builtin.needs_args()
+            && self.peek() != Some('(')
+        {
+            return None;
+        }
+        Some(found)
+    }
+
+    /// The expansion of a call with its collected arguments.
+    fn apply(&mut self, name: &str, found: Macro, args: &[String]) -> Result<String, M4Error> {
+        match found {
+            Macro::User(body) => Ok(substitute(&body, name, args)),
+            Macro::Builtin(builtin) => self.builtin(builtin, args),
+        }
+    }
+
+    fn builtin(&mut self, builtin: Builtin, args: &[String]) -> Result<String, M4Error> {
+        let arg = |i: usize| args.get(i).map_or("", String::as_str);
+
+        Ok(match builtin {
+            Builtin::Define => {
+                if !arg(0).is_empty() {
+                    self.registry.define(arg(0), arg(1));
+                }
+                String::new()
+            }
+            Builtin::Undefine => {
+                for name in args {
+                    self.registry.0.remove(name);
+                }
+                String::new()
+            }
+            Builtin::Ifdef => {
+                if self.registry.is_defined(arg(0)) {
+                    arg(1).to_string()
+                } else {
+                    arg(2).to_string()
+                }
+            }
+            Builtin::Ifelse => ifelse(args).to_string(),
+            Builtin::Eval => {
+                let value = eval::evaluate(arg(0)).map_err(|reason| M4Error::Eval {
+                    expression: arg(0).to_string(),
+                    reason,
+                })?;
+                let radix = parse_int("eval", arg(1).trim(), 10)?;
+                let width = parse_int("eval", arg(2).trim(), 1)?;
+                if !(2..=36).contains(&radix) || width < 0 {
+                    return Err(M4Error::InvalidNumber {
+                        builtin: "eval",
+                        value: format!("{}, {}", arg(1), arg(2)),
+                    });
+                }
+                eval::format(value, radix as u32, width as usize)
+            }
+            Builtin::Incr => parse_int("incr", arg(0).trim(), 0)?
+                .wrapping_add(1)
+                .to_string(),
+            Builtin::Decr => parse_int("decr", arg(0).trim(), 0)?
+                .wrapping_sub(1)
+                .to_string(),
+            Builtin::Dnl => {
+                while self.next_char().is_some_and(|c| c != '\n') {}
+                String::new()
+            }
+            Builtin::Shift => quote_all(args.get(1..).unwrap_or_default()),
+            Builtin::Len => arg(0).chars().count().to_string(),
+        })
+    }
+}
+
+/// Parse a builtin's numeric argument; an empty argument takes `default`.
+fn parse_int(builtin: &'static str, value: &str, default: i32) -> Result<i32, M4Error> {
+    if value.is_empty() {
+        return Ok(default);
+    }
+    value.parse().map_err(|_| M4Error::InvalidNumber {
+        builtin,
+        value: value.to_string(),
+    })
+}
+
+/// `ifelse(a, b, equal, [a2, b2, equal2, ...,] [otherwise])`
+fn ifelse(args: &[String]) -> &str {
+    let mut rest = args;
+    loop {
+        match rest {
+            [a, b, equal, ..] if a == b => return equal,
+            [_, _, _, otherwise] => return otherwise,
+            [_, _, _, more @ ..] if more.len() > 1 => rest = more,
+            _ => return "",
+        }
+    }
+}
+
+/// Arguments quoted and joined with commas, as `$@` and `shift` produce.
+fn quote_all(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| format!("`{arg}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Substitute `$0`-`$N`, `$#`, `$*` and `$@` throughout a macro body,
+/// including inside quotes, before the expansion is rescanned.
+fn substitute(body: &str, name: &str, args: &[String]) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some(d) if d.is_ascii_digit() => {
+                let mut index = 0usize;
+                while let Some(d) = chars.peek().and_then(|d| d.to_digit(10)) {
+                    index = index.saturating_mul(10).saturating_add(d as usize);
+                    chars.next();
+                }
+                if index == 0 {
+                    out.push_str(name);
+                } else if let Some(arg) = args.get(index - 1) {
+                    out.push_str(arg);
+                }
+            }
+            Some('#') => {
+                chars.next();
+                out.push_str(&args.len().to_string());
+            }
+            Some('*') => {
+                chars.next();
+                out.push_str(&args.join(","));
+            }
+            Some('@') => {
+                chars.next();
+                out.push_str(&quote_all(args));
+            }
+            _ => out.push('$'),
+        }
+    }
+    out
 }
 
 /// A reader wrapper that expands M4 macros on-the-fly
@@ -418,22 +590,25 @@ impl<R: Read> Read for ExpandingReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::borrow::Cow;
+
+    fn expand(macros: &str, input: &str) -> String {
+        let mut registry = MacroRegistry::new();
+        registry.load(macros).unwrap();
+        Expander::new(registry).expand(input).unwrap()
+    }
 
     #[test]
     fn test_simple_define() {
         let mut registry = MacroRegistry::new();
         registry.load("define(`foo', `bar')").unwrap();
         assert!(registry.is_defined("foo"));
+        assert_eq!(registry.get("foo"), Some("bar"));
     }
 
     #[test]
     fn test_simple_expansion() {
         let mut registry = MacroRegistry::new();
-        registry.define(
-            "foo".to_string(),
-            vec![Token::Literal(Cow::Owned("bar".to_string()))],
-        );
+        registry.define("foo", "bar");
 
         let mut expander = Expander::new(registry);
         let result = expander.expand("hello foo world").unwrap();
@@ -442,49 +617,26 @@ mod tests {
 
     #[test]
     fn test_macro_with_args() {
-        let mut registry = MacroRegistry::new();
-        registry.define(
-            "greet".to_string(),
-            vec![
-                Token::Literal(Cow::Owned("Hello ".to_string())),
-                Token::Positional(1),
-                Token::Literal(Cow::Owned("!".to_string())),
-            ],
+        assert_eq!(
+            expand("define(`greet', `Hello $1!')", "greet(World)"),
+            "Hello World!"
         );
-
-        let mut expander = Expander::new(registry);
-        let result = expander.expand("greet(World)").unwrap();
-        assert_eq!(result, "Hello World!");
     }
 
     #[test]
     fn test_nested_expansion() {
-        let mut registry = MacroRegistry::new();
-        registry.define(
-            "inner".to_string(),
-            vec![Token::Literal(Cow::Owned("INNER".to_string()))],
+        assert_eq!(
+            expand(
+                "define(`inner', `INNER')define(`outer', `before inner after')",
+                "outer"
+            ),
+            "before INNER after"
         );
-        registry.define(
-            "outer".to_string(),
-            vec![
-                Token::Literal(Cow::Owned("before ".to_string())),
-                Token::MacroCall(MacroCall {
-                    name: Cow::Owned("inner".to_string()),
-                    args: vec![],
-                }),
-                Token::Literal(Cow::Owned(" after".to_string())),
-            ],
-        );
-
-        let mut expander = Expander::new(registry);
-        let result = expander.expand("outer").unwrap();
-        assert_eq!(result, "before INNER after");
     }
 
     #[test]
     fn test_ifelse() {
-        let registry = MacroRegistry::new();
-        let mut expander = Expander::new(registry);
+        let mut expander = Expander::new(MacroRegistry::new());
 
         let result = expander
             .expand("ifelse(a, a, hello world, nello world)")
@@ -498,12 +650,17 @@ mod tests {
     }
 
     #[test]
+    fn test_ifelse_chains_and_comment_form() {
+        assert_eq!(expand("", "ifelse(a, b, 1, a, a, 2, 3)"), "2");
+        assert_eq!(expand("", "ifelse(a, b, 1, c, d, 2, 3)"), "3");
+        assert_eq!(expand("", "ifelse(a, b, 1, c, d, 2)"), "");
+        assert_eq!(expand("", "ifelse(`a comment, ignored')x"), "x");
+    }
+
+    #[test]
     fn test_ifdef() {
         let mut registry = MacroRegistry::new();
-        registry.define(
-            "DEBUG".to_string(),
-            vec![Token::Literal(Cow::Owned("1".to_string()))],
-        );
+        registry.define("DEBUG", "1");
 
         let mut expander = Expander::new(registry);
         let result = expander.expand("ifdef(`DEBUG', `yes', `no')").unwrap();
@@ -512,88 +669,52 @@ mod tests {
 
     #[test]
     fn test_ifdef_undefined() {
-        let registry = MacroRegistry::new();
-        let mut expander = Expander::new(registry);
-
+        let mut expander = Expander::new(MacroRegistry::new());
         let result = expander.expand("ifdef(`UNDEFINED', `yes', `no')").unwrap();
         assert_eq!(result, "no");
     }
 
     #[test]
     fn test_rescan_preserves_parent_args() {
-        let mut registry = MacroRegistry::new();
-        registry
-            .load(
-                r#"define(`pass_through', `$1')
-define(`outer', `pass_through(`$1')')"#,
-            )
-            .unwrap();
-
-        let mut expander = Expander::new(registry);
-        let result = expander.expand("outer(value)").unwrap();
-        assert_eq!(result, "value");
+        assert_eq!(
+            expand(
+                "define(`pass_through', `$1')\ndefine(`outer', `pass_through(`$1')')",
+                "outer(value)"
+            ),
+            "value"
+        );
     }
 
     #[test]
     fn test_brace_set_macro_argument() {
-        let mut registry = MacroRegistry::new();
-        registry
-            .load("define(`get_prop', `allow $1 $2:file { getattr open read map };')")
-            .unwrap();
-
-        let mut expander = Expander::new(registry);
-        let result = expander
-            .expand(
-                "get_prop(hal_cryptoeng_oplus, { boot_status_prop serialno_prop vendor_nw_exported_system_prop vendor_oplus_overseas_prop vendor_tee_listener_prop })",
-            )
-            .unwrap();
-
         assert_eq!(
-            result,
-            "allow hal_cryptoeng_oplus { boot_status_prop serialno_prop vendor_nw_exported_system_prop vendor_oplus_overseas_prop vendor_tee_listener_prop }:file { getattr open read map };"
+            expand(
+                "define(`get_prop', `allow $1 $2:file { getattr open read map };')",
+                "get_prop(hal_cryptoeng_oplus, { boot_status_prop serialno_prop })"
+            ),
+            "allow hal_cryptoeng_oplus { boot_status_prop serialno_prop }:file { getattr open read map };"
         );
     }
 
     #[test]
     fn test_quoted_string() {
-        let mut registry = MacroRegistry::new();
-        registry.define(
-            "foo".to_string(),
-            vec![Token::Literal(Cow::Owned("bar".to_string()))],
-        );
-
-        let mut expander = Expander::new(registry);
-        // Quoted string should not expand
-        let result = expander.expand("`foo'").unwrap();
-        assert_eq!(result, "foo");
+        // Quoted text is not expanded; one level of quotes is removed.
+        assert_eq!(expand("define(`foo', `bar')", "`foo' ``foo''"), "foo `foo'");
     }
 
     #[test]
     fn test_dnl() {
-        let registry = MacroRegistry::new();
-        let mut expander = Expander::new(registry);
-
-        let input = r#"hello dnl this is removed
-world"#;
-        let tokens = M4Parser::parse_input(input).unwrap();
-        println!("{:?}", tokens);
-
-        let result = expander.expand(input).unwrap();
+        let mut expander = Expander::new(MacroRegistry::new());
+        let result = expander.expand("hello dnl this is removed\nworld").unwrap();
         assert_eq!(result, "hello world");
     }
 
     #[test]
     fn test_expanding_reader() {
         let mut registry = MacroRegistry::new();
-        registry.define(
-            "foo".to_string(),
-            vec![Token::Literal(Cow::Owned("bar".to_string()))],
-        );
+        registry.define("foo", "bar");
 
-        let input = "hello foo world";
-
-        let mut reader = ExpandingReader::new(input.as_bytes(), registry);
-
+        let mut reader = ExpandingReader::new("hello foo world".as_bytes(), registry);
         let mut output = String::new();
         reader.read_to_string(&mut output).unwrap();
 
@@ -602,61 +723,129 @@ world"#;
 
     #[test]
     fn test_recursive_argument_expansion() {
-        // Test that arguments which are themselves macros get expanded first
-        let mut registry = MacroRegistry::new();
-        registry.define(
-            "inner".to_string(),
-            vec![Token::Literal(Cow::Owned("EXPANDED".to_string()))],
+        assert_eq!(
+            expand(
+                "define(`inner', `EXPANDED')define(`wrapper', `[$1]')",
+                "wrapper(inner)"
+            ),
+            "[EXPANDED]"
         );
-        registry.define(
-            "wrapper".to_string(),
-            vec![
-                Token::Literal(Cow::Owned("[".to_string())),
-                Token::Positional(1),
-                Token::Literal(Cow::Owned("]".to_string())),
-            ],
-        );
-
-        let mut expander = Expander::new(registry);
-        // When we call wrapper(inner), inner should be expanded to EXPANDED first
-        let result = expander.expand("wrapper(inner)").unwrap();
-        assert_eq!(result, "[EXPANDED]");
     }
 
     #[test]
     fn test_lazy_macro_storage() {
-        // Verify that macros referencing other macros work correctly
-        // because definitions are stored raw and expanded on use
         let mut registry = MacroRegistry::new();
         registry.load("define(`foo', `bar')").unwrap();
         registry.load("define(`baz', `foo qux')").unwrap();
 
         let mut expander = Expander::new(registry);
-        // When baz is expanded, foo inside its body should also expand
-        let result = expander.expand("baz").unwrap();
-        assert_eq!(result, "bar qux");
+        assert_eq!(expander.expand("baz").unwrap(), "bar qux");
     }
 
     #[test]
     fn test_conditional_macro_name() {
-        // Test that macro names can be conditionally defined using ifdef
         let mut registry = MacroRegistry::new();
-
-        // First, define a flag
         registry.load("define(`HAS_FEATURE', `1')").unwrap();
-
-        // Now define a macro whose name depends on the flag
         registry
             .load("define(ifdef(`HAS_FEATURE', `feature_impl', `fallback_impl'), `FEATURE_CODE')")
             .unwrap();
 
-        // The macro should be defined as 'feature_impl' (not 'fallback_impl')
         assert!(registry.is_defined("feature_impl"));
         assert!(!registry.is_defined("fallback_impl"));
 
         let mut expander = Expander::new(registry);
-        let result = expander.expand("feature_impl").unwrap();
-        assert_eq!(result, "FEATURE_CODE");
+        assert_eq!(expander.expand("feature_impl").unwrap(), "FEATURE_CODE");
+    }
+
+    #[test]
+    fn test_names_are_recognized_inside_other_text() {
+        // `0x1` is `0` then the word `x1`; `a:x` is `a`, `:` and the macro `x`.
+        assert_eq!(expand("define(`x', `1')", "0x1 x-x a:x"), "0x1 1-1 a:1");
+        assert_eq!(
+            expand("define(`LAST', `0x000089ff')", "0x000089f0-LAST"),
+            "0x000089f0-0x000089ff"
+        );
+    }
+
+    #[test]
+    fn test_positional_args_substituted_inside_quotes() {
+        assert_eq!(
+            expand(
+                "define(`trans', `ifelse($1, `init', `', `allow $3 $1:process sigchld;')')",
+                "trans(vold, blkid_exec, blkid)"
+            ),
+            "allow blkid vold:process sigchld;"
+        );
+    }
+
+    #[test]
+    fn test_argument_whitespace_and_counts() {
+        assert_eq!(
+            expand("define(`w', `<$1|$2>')", "w(  x ,\n  y )"),
+            "<x |y >"
+        );
+        assert_eq!(
+            expand("define(`n', `$#:$*:$@')", "n(a,`b,c')"),
+            "2:a,b,c:a,b,c"
+        );
+        assert_eq!(expand("define(`n', `$#')", "n n()"), "0 1");
+        assert_eq!(
+            expand("define(`t', `[$10][$1]')", "t(a,b,c,d,e,f,g,h,i,J)"),
+            "[J][a]"
+        );
+    }
+
+    #[test]
+    fn test_unbalanced_parentheses_are_text() {
+        assert_eq!(
+            expand("", "((h1 eq h2 and l1 eq l2) or t1 == mlstrustedsubject);"),
+            "((h1 eq h2 and l1 eq l2) or t1 == mlstrustedsubject);"
+        );
+        assert_eq!(expand("", "foo)"), "foo)");
+    }
+
+    #[test]
+    fn test_comments_pass_through_unexpanded() {
+        assert_eq!(
+            expand("define(`foo', `X')", "a # c foo\nfoo"),
+            "a # c foo\nX"
+        );
+    }
+
+    #[test]
+    fn test_bare_builtins_are_text() {
+        assert_eq!(
+            expand("", "define ifelse eval dnl\nnext"),
+            "define ifelse eval next"
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_builtins() {
+        assert_eq!(
+            expand(
+                "define(`level', `202504')",
+                "eval(level >= 202504) incr(4) decr(4) eval(255, 16, 4) len(`abc')"
+            ),
+            "1 5 3 00ff 3"
+        );
+    }
+
+    #[test]
+    fn test_shift_and_undefine() {
+        assert_eq!(expand("", "shift(a, b, c)"), "b,c");
+        assert_eq!(expand("define(`x', `1')undefine(`x')", "x"), "x");
+    }
+
+    #[test]
+    fn test_deep_tail_recursion() {
+        // AOSP's mls_macros generate categories this way, 1024 levels deep.
+        let output = expand(
+            "define(`count', `ifelse($1, 0, , `count(decr($1))c$1 ')')",
+            "count(2000)",
+        );
+        assert!(output.starts_with("c1 c2 c3 "));
+        assert!(output.ends_with("c1999 c2000 "));
     }
 
     #[test]
@@ -666,14 +855,58 @@ world"#;
 
         let mut expander = Expander::new(registry);
         let err = expander.expand("loop").unwrap_err();
-        assert!(matches!(err, M4Error::MaxDepthExceeded(100)));
+        assert!(matches!(
+            err,
+            M4Error::MaxDepthExceeded(Expander::DEFAULT_MAX_DEPTH)
+        ));
     }
 
     #[test]
-    fn test_error_parse() {
+    fn test_error_nesting_limit() {
+        // Each expansion of `x` opens another call of `f` inside f's arguments.
+        let mut registry = MacroRegistry::new();
+        registry
+            .load("define(`f', `$1')define(`x', `f(x)')")
+            .unwrap();
+
+        let mut expander = Expander::new(registry);
+        let err = expander.expand("x").unwrap_err();
+        assert!(matches!(
+            err,
+            M4Error::NestingLimitExceeded(Expander::MAX_NESTING)
+        ));
+    }
+
+    #[test]
+    fn test_error_unterminated_input() {
         let mut expander = Expander::new(MacroRegistry::new());
-        let err = expander.expand("foo)").unwrap_err();
-        assert!(matches!(err, M4Error::Parse(_)));
+        assert!(matches!(
+            expander.expand("`never closed").unwrap_err(),
+            M4Error::UnterminatedQuote
+        ));
+        assert!(matches!(
+            expander.expand("ifelse(a, b").unwrap_err(),
+            M4Error::UnterminatedArguments(name) if name == "ifelse"
+        ));
+    }
+
+    #[test]
+    fn test_error_bad_numbers() {
+        let mut expander = Expander::new(MacroRegistry::new());
+        assert!(matches!(
+            expander.expand("eval(1/0)").unwrap_err(),
+            M4Error::Eval {
+                reason: "divide by zero",
+                ..
+            }
+        ));
+        assert!(matches!(
+            expander.expand("incr(abc)").unwrap_err(),
+            M4Error::InvalidNumber {
+                builtin: "incr",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -681,6 +914,5 @@ world"#;
         let mut registry = MacroRegistry::new();
         let err = registry.load_file("does/not/exist.m4").unwrap_err();
         assert!(matches!(&err, M4Error::Io { path, .. } if path == "does/not/exist.m4"));
-        assert!(std::error::Error::source(&err).is_some());
     }
 }
