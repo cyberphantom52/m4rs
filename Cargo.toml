@@ -4,6 +4,6 @@ version = "0.1.1"
 edition = "2024"
 
 [dependencies]
-pest = "2.8.4"
-pest_derive = "2.8.4"
-thiserror = "2.0.17"
+pest = "2.9.5"
+pest_derive = "2.9.5"
+thiserror = "2.0.21"
