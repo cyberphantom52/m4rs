@@ -12,6 +12,15 @@ pub enum M4Error {
         #[source]
         source: io::Error,
     },
+    /// The input could not be read
+    #[error("failed to read input")]
+    Read(#[source] io::Error),
+    /// The output could not be written
+    #[error("failed to write output")]
+    Write(#[source] io::Error),
+    /// The input is not valid UTF-8
+    #[error("input is not valid UTF-8")]
+    InvalidUtf8,
     /// Expansion recursed deeper than the expander allows
     #[error("maximum expansion depth of {0} exceeded")]
     MaxDepthExceeded(usize),

@@ -8,7 +8,7 @@
 //! example after `:` or `-`.
 
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 use crate::error::M4Error;
 use crate::eval;
@@ -78,8 +78,11 @@ impl MacroRegistry {
     /// Load macro definitions from M4 source text. The source is expanded
     /// and its output discarded; `define` calls populate the registry.
     pub fn load(&mut self, source: &str) -> Result<(), M4Error> {
-        Scanner::new(self, Expander::DEFAULT_MAX_DEPTH).expand(source)?;
-        Ok(())
+        let registry = std::mem::take(self);
+        let mut scanner = Scanner::new(registry, source.as_bytes(), Expander::DEFAULT_MAX_DEPTH);
+        let result = scanner.run(&mut io::sink());
+        *self = scanner.into_registry();
+        result
     }
 
     /// Load macro definitions from a file
@@ -141,7 +144,81 @@ impl Expander {
 
     /// Expand all macros in the input text
     pub fn expand(&mut self, input: &str) -> Result<String, M4Error> {
-        Scanner::new(&mut self.registry, self.max_depth).expand(input)
+        let mut out = Vec::with_capacity(input.len());
+        self.expand_to(input.as_bytes(), &mut out)?;
+        Ok(String::from_utf8(out).expect("expanding UTF-8 input produces UTF-8"))
+    }
+
+    /// Expand UTF-8 input from `reader` into `writer` as it is read. Only the
+    /// text of a pending macro call, quoted string or comment is held in
+    /// memory; other output is written as soon as it is complete.
+    pub fn expand_to(&mut self, reader: impl Read, mut writer: impl Write) -> Result<(), M4Error> {
+        let registry = std::mem::take(&mut self.registry);
+        let mut scanner = Scanner::new(registry, reader, self.max_depth);
+        let result = scanner.run(&mut writer);
+        self.registry = scanner.into_registry();
+        result
+    }
+}
+
+/// Input not yet read from the underlying reader, decoded one chunk at a
+/// time. Consumed text is dropped when the next chunk is decoded.
+struct Source<R> {
+    reader: R,
+    text: String,
+    pos: usize,
+    /// Bytes of a character split across chunks.
+    partial: Vec<u8>,
+    eof: bool,
+}
+
+const CHUNK: usize = 8192;
+
+impl<R: Read> Source<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            text: String::new(),
+            pos: 0,
+            partial: Vec::new(),
+            eof: false,
+        }
+    }
+
+    /// Decode the next chunk; `false` once the reader is exhausted. A chunk
+    /// may decode to nothing when it ends inside a multi-byte character.
+    fn fill(&mut self) -> Result<bool, M4Error> {
+        if self.eof {
+            return Ok(false);
+        }
+        let mut chunk = [0u8; CHUNK];
+        let read = loop {
+            match self.reader.read(&mut chunk) {
+                Ok(read) => break read,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(M4Error::Read(err)),
+            }
+        };
+        if read == 0 {
+            self.eof = true;
+            if !self.partial.is_empty() {
+                return Err(M4Error::InvalidUtf8);
+            }
+            return Ok(false);
+        }
+
+        self.partial.extend_from_slice(&chunk[..read]);
+        let valid = match std::str::from_utf8(&self.partial) {
+            Ok(_) => self.partial.len(),
+            Err(err) if err.error_len().is_none() => err.valid_up_to(),
+            Err(_) => return Err(M4Error::InvalidUtf8),
+        };
+        self.text.clear();
+        self.text
+            .push_str(std::str::from_utf8(&self.partial[..valid]).expect("validated as UTF-8"));
+        self.partial.drain(..valid);
+        self.pos = 0;
+        Ok(true)
     }
 }
 
@@ -191,125 +268,151 @@ fn sink<'a>(out: &'a mut String, calls: &'a mut [PendingCall]) -> &'a mut String
     }
 }
 
-struct Scanner<'r> {
-    registry: &'r mut MacroRegistry,
-    input: Vec<Frame>,
+/// Expansion state: pushed-back expansions over the remaining input, and
+/// the calls still collecting arguments. Calls live on this explicit stack
+/// rather than the Rust call stack, so nesting is bounded by
+/// [`Expander::MAX_NESTING`], not by the thread's stack size.
+struct Scanner<R> {
+    registry: MacroRegistry,
+    frames: Vec<Frame>,
+    source: Source<R>,
+    calls: Vec<PendingCall>,
+    /// GNU m4 skips unquoted whitespace at the start of each argument.
+    at_arg_start: bool,
     max_depth: usize,
 }
 
-impl<'r> Scanner<'r> {
-    fn new(registry: &'r mut MacroRegistry, max_depth: usize) -> Self {
+impl<R: Read> Scanner<R> {
+    fn new(registry: MacroRegistry, reader: R, max_depth: usize) -> Self {
         Self {
             registry,
-            input: Vec::new(),
+            frames: Vec::new(),
+            source: Source::new(reader),
+            calls: Vec::new(),
+            at_arg_start: false,
             max_depth,
         }
     }
 
-    /// Expand `input`. Calls collecting arguments are kept on an explicit
-    /// stack rather than the Rust call stack, so nesting depth is bounded by
-    /// [`Expander::MAX_NESTING`], not by the thread's stack size.
-    fn expand(mut self, input: &str) -> Result<String, M4Error> {
-        self.input.push(Frame {
-            text: input.to_string(),
-            pos: 0,
-            depth: 0,
-        });
+    fn into_registry(self) -> MacroRegistry {
+        self.registry
+    }
 
-        let mut out = String::with_capacity(input.len());
-        let mut calls: Vec<PendingCall> = Vec::new();
-        // GNU m4 skips unquoted whitespace at the start of each argument.
-        let mut at_arg_start = false;
-
-        loop {
-            if at_arg_start {
-                while self.peek().is_some_and(char::is_whitespace) {
-                    self.next_char();
-                }
-                at_arg_start = false;
+    /// Expand to the end of input, writing output as it accumulates.
+    fn run(&mut self, writer: &mut impl Write) -> Result<(), M4Error> {
+        let mut out = String::new();
+        while self.step(&mut out)? {
+            if out.len() >= CHUNK {
+                writer.write_all(out.as_bytes()).map_err(M4Error::Write)?;
+                out.clear();
             }
+        }
+        writer.write_all(out.as_bytes()).map_err(M4Error::Write)?;
+        writer.flush().map_err(M4Error::Write)
+    }
 
-            match self.next_token()? {
-                Token::Eof => {
-                    return match calls.pop() {
-                        Some(call) => Err(M4Error::UnterminatedArguments(call.name)),
-                        None => Ok(out),
-                    };
+    /// Process one token, appending any finished output to `out`; `false`
+    /// at the end of input.
+    fn step(&mut self, out: &mut String) -> Result<bool, M4Error> {
+        if self.at_arg_start {
+            while self.peek()?.is_some_and(char::is_whitespace) {
+                self.next_char()?;
+            }
+            self.at_arg_start = false;
+        }
+
+        match self.next_token()? {
+            Token::Eof => {
+                return match self.calls.pop() {
+                    Some(call) => Err(M4Error::UnterminatedArguments(call.name)),
+                    None => Ok(false),
+                };
+            }
+            Token::Word(word, depth) => match self.callable(&word)? {
+                Some(found) if self.peek()? == Some('(') => {
+                    self.next_char()?;
+                    if self.calls.len() == Expander::MAX_NESTING {
+                        return Err(M4Error::NestingLimitExceeded(Expander::MAX_NESTING));
+                    }
+                    self.calls.push(PendingCall {
+                        name: word,
+                        found,
+                        depth,
+                        args: Vec::new(),
+                        current: String::new(),
+                        parens: 0,
+                    });
+                    self.at_arg_start = true;
                 }
-                Token::Word(word, depth) => match self.callable(&word) {
-                    Some(found) if self.peek() == Some('(') => {
-                        self.next_char();
-                        if calls.len() == Expander::MAX_NESTING {
-                            return Err(M4Error::NestingLimitExceeded(Expander::MAX_NESTING));
-                        }
-                        calls.push(PendingCall {
-                            name: word,
-                            found,
-                            depth,
-                            args: Vec::new(),
-                            current: String::new(),
-                            parens: 0,
-                        });
-                        at_arg_start = true;
-                    }
-                    Some(found) => {
-                        let expansion = self.apply(&word, found, &[])?;
-                        self.push(expansion, depth + 1)?;
-                    }
-                    None => sink(&mut out, &mut calls).push_str(&word),
-                },
-                Token::Quoted(text) | Token::Comment(text) => {
-                    sink(&mut out, &mut calls).push_str(&text)
+                Some(found) => {
+                    let expansion = self.apply(&word, found, &[])?;
+                    self.push(expansion, depth + 1)?;
                 }
-                Token::Char(c) => {
-                    let Some(call) = calls.last_mut() else {
-                        out.push(c);
-                        continue;
-                    };
-                    match c {
-                        '(' => {
-                            call.parens += 1;
-                            call.current.push(c);
-                        }
-                        ')' if call.parens == 0 => {
-                            let call = calls.pop().expect("a call is pending");
-                            let mut args = call.args;
-                            args.push(call.current);
-                            let expansion = self.apply(&call.name, call.found, &args)?;
-                            self.push(expansion, call.depth + 1)?;
-                        }
-                        ')' => {
-                            call.parens -= 1;
-                            call.current.push(c);
-                        }
-                        ',' if call.parens == 0 => {
-                            call.args.push(std::mem::take(&mut call.current));
-                            at_arg_start = true;
-                        }
-                        _ => call.current.push(c),
+                None => sink(out, &mut self.calls).push_str(&word),
+            },
+            Token::Quoted(text) | Token::Comment(text) => {
+                sink(out, &mut self.calls).push_str(&text)
+            }
+            Token::Char(c) => {
+                let Some(call) = self.calls.last_mut() else {
+                    out.push(c);
+                    return Ok(true);
+                };
+                match c {
+                    '(' => {
+                        call.parens += 1;
+                        call.current.push(c);
                     }
+                    ')' if call.parens == 0 => {
+                        let call = self.calls.pop().expect("a call is pending");
+                        let mut args = call.args;
+                        args.push(call.current);
+                        let expansion = self.apply(&call.name, call.found, &args)?;
+                        self.push(expansion, call.depth + 1)?;
+                    }
+                    ')' => {
+                        call.parens -= 1;
+                        call.current.push(c);
+                    }
+                    ',' if call.parens == 0 => {
+                        call.args.push(std::mem::take(&mut call.current));
+                        self.at_arg_start = true;
+                    }
+                    _ => call.current.push(c),
                 }
             }
         }
+        Ok(true)
     }
 
     /// Drop exhausted frames and return the next character without
-    /// consuming it.
-    fn peek(&mut self) -> Option<char> {
-        while let Some(frame) = self.input.last() {
+    /// consuming it, reading more input when the frames run out.
+    fn peek(&mut self) -> Result<Option<char>, M4Error> {
+        while let Some(frame) = self.frames.last() {
             if let Some(c) = frame.text[frame.pos..].chars().next() {
-                return Some(c);
+                return Ok(Some(c));
             }
-            self.input.pop();
+            self.frames.pop();
         }
-        None
+        loop {
+            if let Some(c) = self.source.text[self.source.pos..].chars().next() {
+                return Ok(Some(c));
+            }
+            if !self.source.fill()? {
+                return Ok(None);
+            }
+        }
     }
 
-    fn next_char(&mut self) -> Option<char> {
-        let c = self.peek()?;
-        let frame = self.input.last_mut().expect("peek found a frame");
-        frame.pos += c.len_utf8();
-        Some(c)
+    fn next_char(&mut self) -> Result<Option<char>, M4Error> {
+        let Some(c) = self.peek()? else {
+            return Ok(None);
+        };
+        match self.frames.last_mut() {
+            Some(frame) => frame.pos += c.len_utf8(),
+            None => self.source.pos += c.len_utf8(),
+        }
+        Ok(Some(c))
     }
 
     fn push(&mut self, text: String, depth: usize) -> Result<(), M4Error> {
@@ -317,7 +420,7 @@ impl<'r> Scanner<'r> {
             return Err(M4Error::MaxDepthExceeded(self.max_depth));
         }
         if !text.is_empty() {
-            self.input.push(Frame {
+            self.frames.push(Frame {
                 text,
                 pos: 0,
                 depth,
@@ -327,27 +430,27 @@ impl<'r> Scanner<'r> {
     }
 
     fn next_token(&mut self) -> Result<Token, M4Error> {
-        let Some(c) = self.peek() else {
+        let Some(c) = self.peek()? else {
             return Ok(Token::Eof);
         };
 
         if is_word_start(c) {
-            let depth = self.input.last().map_or(0, |frame| frame.depth);
+            let depth = self.frames.last().map_or(0, |frame| frame.depth);
             let mut word = String::new();
-            while let Some(c) = self.peek().filter(|&c| is_word_char(c)) {
+            while let Some(c) = self.peek()?.filter(|&c| is_word_char(c)) {
                 word.push(c);
-                self.next_char();
+                self.next_char()?;
             }
             return Ok(Token::Word(word, depth));
         }
 
-        self.next_char();
+        self.next_char()?;
         match c {
             '`' => {
                 let mut text = String::new();
                 let mut level = 1;
                 loop {
-                    let c = self.next_char().ok_or(M4Error::UnterminatedQuote)?;
+                    let c = self.next_char()?.ok_or(M4Error::UnterminatedQuote)?;
                     match c {
                         '`' => level += 1,
                         '\'' => {
@@ -363,7 +466,7 @@ impl<'r> Scanner<'r> {
             }
             '#' => {
                 let mut text = String::from('#');
-                while let Some(c) = self.next_char() {
+                while let Some(c) = self.next_char()? {
                     text.push(c);
                     if c == '\n' {
                         break;
@@ -376,15 +479,17 @@ impl<'r> Scanner<'r> {
     }
 
     /// The macro `word` names, if this occurrence is a call.
-    fn callable(&mut self, word: &str) -> Option<Macro> {
-        let found = self.registry.0.get(word)?.clone();
+    fn callable(&mut self, word: &str) -> Result<Option<Macro>, M4Error> {
+        let Some(found) = self.registry.0.get(word).cloned() else {
+            return Ok(None);
+        };
         if let Macro::Builtin(builtin) = found
             && builtin.needs_args()
-            && self.peek() != Some('(')
+            && self.peek()? != Some('(')
         {
-            return None;
+            return Ok(None);
         }
-        Some(found)
+        Ok(Some(found))
     }
 
     /// The expansion of a call with its collected arguments.
@@ -441,7 +546,7 @@ impl<'r> Scanner<'r> {
                 .wrapping_sub(1)
                 .to_string(),
             Builtin::Dnl => {
-                while self.next_char().is_some_and(|c| c != '\n') {}
+                while self.next_char()?.is_some_and(|c| c != '\n') {}
                 String::new()
             }
             Builtin::Shift => quote_all(args.get(1..).unwrap_or_default()),
@@ -523,67 +628,49 @@ fn substitute(body: &str, name: &str, args: &[String]) -> String {
     out
 }
 
-/// A reader wrapper that expands M4 macros on-the-fly
+/// A reader that expands M4 input from another reader as it is read. Each
+/// `read` expands only as much input as it needs to return some output.
 pub struct ExpandingReader<R: Read> {
-    inner: R,
-    registry: MacroRegistry,
-    buffer: Vec<u8>,
-    buffer_pos: usize,
+    scanner: Scanner<R>,
+    out: String,
+    out_pos: usize,
     done: bool,
 }
 
 impl<R: Read> ExpandingReader<R> {
     pub fn new(inner: R, registry: MacroRegistry) -> Self {
         Self {
-            inner,
-            registry,
-            buffer: Vec::new(),
-            buffer_pos: 0,
+            scanner: Scanner::new(registry, inner, Expander::DEFAULT_MAX_DEPTH),
+            out: String::new(),
+            out_pos: 0,
             done: false,
         }
     }
 
-    fn fill_buffer(&mut self) -> io::Result<()> {
-        if self.done {
-            return Ok(());
-        }
-
-        // Read the entire input (for now - could be optimized for streaming)
-        let mut input = String::new();
-        self.inner.read_to_string(&mut input)?;
-
-        let mut expander = Expander::new(self.registry.clone());
-        match expander.expand(&input) {
-            Ok(expanded) => {
-                self.buffer = expanded.into_bytes();
-                self.buffer_pos = 0;
-            }
-            Err(e) => {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, e));
-            }
-        }
-
-        self.done = true;
-        Ok(())
+    /// The macro definitions, including any the input has defined so far.
+    pub fn into_registry(self) -> MacroRegistry {
+        self.scanner.into_registry()
     }
 }
 
 impl<R: Read> Read for ExpandingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.buffer_pos >= self.buffer.len() && !self.done {
-            self.fill_buffer()?;
+        while self.out_pos == self.out.len() && !self.done {
+            self.out.clear();
+            self.out_pos = 0;
+            match self.scanner.step(&mut self.out) {
+                Ok(true) => {}
+                Ok(false) => self.done = true,
+                Err(M4Error::Read(err)) => return Err(err),
+                Err(err) => return Err(io::Error::new(io::ErrorKind::InvalidData, err)),
+            }
         }
 
-        if self.buffer_pos >= self.buffer.len() {
-            return Ok(0);
-        }
-
-        let available = self.buffer.len() - self.buffer_pos;
-        let to_copy = std::cmp::min(available, buf.len());
-        buf[..to_copy].copy_from_slice(&self.buffer[self.buffer_pos..self.buffer_pos + to_copy]);
-        self.buffer_pos += to_copy;
-
-        Ok(to_copy)
+        let available = &self.out.as_bytes()[self.out_pos..];
+        let len = available.len().min(buf.len());
+        buf[..len].copy_from_slice(&available[..len]);
+        self.out_pos += len;
+        Ok(len)
     }
 }
 
@@ -914,5 +1001,118 @@ mod tests {
         let mut registry = MacroRegistry::new();
         let err = registry.load_file("does/not/exist.m4").unwrap_err();
         assert!(matches!(&err, M4Error::Io { path, .. } if path == "does/not/exist.m4"));
+    }
+
+    /// Yields one byte per `read` call.
+    struct ByteReader<'a>(&'a [u8]);
+
+    impl Read for ByteReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.split_first() {
+                Some((&byte, rest)) if !buf.is_empty() => {
+                    buf[0] = byte;
+                    self.0 = rest;
+                    Ok(1)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    /// Repeats a pattern forever.
+    struct Endless(&'static [u8], usize);
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            for byte in buf.iter_mut() {
+                *byte = self.0[self.1 % self.0.len()];
+                self.1 += 1;
+            }
+            Ok(buf.len())
+        }
+    }
+
+    /// Accepts `limit` bytes, then fails.
+    struct LimitedWriter {
+        written: usize,
+        limit: usize,
+    }
+
+    impl Write for LimitedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written >= self.limit {
+                return Err(io::Error::other("writer full"));
+            }
+            self.written += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn registry(macros: &str) -> MacroRegistry {
+        let mut registry = MacroRegistry::new();
+        registry.load(macros).unwrap();
+        registry
+    }
+
+    #[test]
+    fn test_streaming_matches_in_memory_expansion() {
+        let macros = "define(`grüß', `$1 → ünïcode')define(`dir', `/données/$1')";
+        let input = "a grüß(wörld) b dir(é) `quoted grüß' # comment grüß\nend";
+        let expected = expand(macros, input);
+
+        // One byte per read splits multi-byte characters and macro calls.
+        let mut out = Vec::new();
+        Expander::new(registry(macros))
+            .expand_to(ByteReader(input.as_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+
+        let mut reader = ExpandingReader::new(ByteReader(input.as_bytes()), registry(macros));
+        let mut via_reader = String::new();
+        reader.read_to_string(&mut via_reader).unwrap();
+        assert_eq!(via_reader, expected);
+    }
+
+    #[test]
+    fn test_expanding_reader_reads_incrementally() {
+        // Buffering the whole input first would never return on endless input.
+        let mut reader =
+            ExpandingReader::new(Endless(b"foo ", 0), registry("define(`foo', `bar')"));
+        let mut buf = [0u8; 16];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"bar bar bar bar ");
+    }
+
+    #[test]
+    fn test_expand_to_writes_while_reading() {
+        let mut writer = LimitedWriter {
+            written: 0,
+            limit: 1 << 16,
+        };
+        let err = Expander::new(registry("define(`foo', `bar')"))
+            .expand_to(Endless(b"foo ", 0), &mut writer)
+            .unwrap_err();
+        assert!(matches!(err, M4Error::Write(_)));
+        assert!(writer.written >= 1 << 16);
+    }
+
+    #[test]
+    fn test_error_invalid_utf8() {
+        let mut expander = Expander::new(MacroRegistry::new());
+        assert!(matches!(
+            expander.expand_to(&b"ok \xff"[..], io::sink()).unwrap_err(),
+            M4Error::InvalidUtf8
+        ));
+        // A multi-byte character cut off at the end of input.
+        assert!(matches!(
+            expander
+                .expand_to(&"é".as_bytes()[..1], io::sink())
+                .unwrap_err(),
+            M4Error::InvalidUtf8
+        ));
     }
 }

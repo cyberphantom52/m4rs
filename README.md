@@ -6,7 +6,7 @@ A Rust implementation of an M4 macro processor following GNU m4's expansion rule
 
 - **GNU m4 semantics**: a streaming expander with a pushback input stack, so expansions are rescanned, arguments are expanded as they are collected, and macro names are recognized anywhere in the text (after `:` or `-`, inside `0x...-NAME`)
 - **Builtins**: `define`, `undefine`, `ifdef`, `ifelse` (with chained conditions), `eval` (32-bit integer arithmetic with C operators and `**`), `incr`, `decr`, `len`, `shift` and `dnl`, plus `$0`-`$N`, `$#`, `$*` and `$@`
-- **Streaming expansion** via `ExpandingReader` implementing `std::io::Read`
+- **Streaming I/O**: `Expander::expand_to` reads from any `Read` and writes to any `Write` as it goes, and `ExpandingReader` implements `Read`, expanding only as much input as each `read` needs; only pending calls, quoted strings and comments are buffered
 - **Bounded**: GNU m4's nesting limit of 1024 pending calls, kept on the heap rather than the call stack, and a rescan-depth limit that turns infinite recursion into an error
 
 Quoting uses `` ` `` and `'`; comments start with `#` and pass through unexpanded. `changequote`, `changecom`, `divert`, `include` and the other GNU builtins are not implemented.
@@ -44,24 +44,31 @@ let mut registry = MacroRegistry::new();
 registry.load_file("macros.m4").expect("Failed to load macros");
 ```
 
-### Streaming Expansion with `ExpandingReader`
+### Streaming Expansion
 
 ```rust
 use std::fs::File;
-use std::io::Read;
-use m4rs::processor::{ExpandingReader, MacroRegistry};
+use std::io::{self, BufWriter, Read};
+use m4rs::processor::{Expander, ExpandingReader, MacroRegistry};
 
 let mut registry = MacroRegistry::new();
 registry.load_file("macros.m4").expect("Failed to load macros");
 
+// Push: expand a file to stdout, writing output while input is read.
+let input = File::open("input.m4").expect("Failed to open input");
+let mut expander = Expander::new(registry.clone());
+expander
+    .expand_to(input, BufWriter::new(io::stdout()))
+    .expect("Failed to expand");
+
+// Pull: read expanded output through std::io::Read.
 let input = File::open("input.m4").expect("Failed to open input");
 let mut reader = ExpandingReader::new(input, registry);
-
 let mut output = String::new();
 reader.read_to_string(&mut output).expect("Failed to expand");
 ```
 
-
+Input must be UTF-8; multi-byte characters may be split across reads.
 
 ## Architecture
 
