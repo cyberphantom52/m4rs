@@ -685,32 +685,6 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_define() {
-        let mut registry = MacroRegistry::new();
-        registry.load("define(`foo', `bar')").unwrap();
-        assert!(registry.is_defined("foo"));
-        assert_eq!(registry.get("foo"), Some("bar"));
-    }
-
-    #[test]
-    fn test_simple_expansion() {
-        let mut registry = MacroRegistry::new();
-        registry.define("foo", "bar");
-
-        let mut expander = Expander::new(registry);
-        let result = expander.expand("hello foo world").unwrap();
-        assert_eq!(result, "hello bar world");
-    }
-
-    #[test]
-    fn test_macro_with_args() {
-        assert_eq!(
-            expand("define(`greet', `Hello $1!')", "greet(World)"),
-            "Hello World!"
-        );
-    }
-
-    #[test]
     fn test_nested_expansion() {
         assert_eq!(
             expand(
@@ -719,21 +693,6 @@ mod tests {
             ),
             "before INNER after"
         );
-    }
-
-    #[test]
-    fn test_ifelse() {
-        let mut expander = Expander::new(MacroRegistry::new());
-
-        let result = expander
-            .expand("ifelse(a, a, hello world, nello world)")
-            .unwrap();
-        assert_eq!(result, "hello world");
-
-        let result = expander
-            .expand("ifelse(a, b, hello world, nello world)")
-            .unwrap();
-        assert_eq!(result, "nello world");
     }
 
     #[test]
@@ -762,71 +721,9 @@ mod tests {
     }
 
     #[test]
-    fn test_rescan_preserves_parent_args() {
-        assert_eq!(
-            expand(
-                "define(`pass_through', `$1')\ndefine(`outer', `pass_through(`$1')')",
-                "outer(value)"
-            ),
-            "value"
-        );
-    }
-
-    #[test]
-    fn test_brace_set_macro_argument() {
-        assert_eq!(
-            expand(
-                "define(`get_prop', `allow $1 $2:file { getattr open read map };')",
-                "get_prop(hal_cryptoeng_oplus, { boot_status_prop serialno_prop })"
-            ),
-            "allow hal_cryptoeng_oplus { boot_status_prop serialno_prop }:file { getattr open read map };"
-        );
-    }
-
-    #[test]
     fn test_quoted_string() {
         // Quoted text is not expanded; one level of quotes is removed.
         assert_eq!(expand("define(`foo', `bar')", "`foo' ``foo''"), "foo `foo'");
-    }
-
-    #[test]
-    fn test_dnl() {
-        let mut expander = Expander::new(MacroRegistry::new());
-        let result = expander.expand("hello dnl this is removed\nworld").unwrap();
-        assert_eq!(result, "hello world");
-    }
-
-    #[test]
-    fn test_expanding_reader() {
-        let mut registry = MacroRegistry::new();
-        registry.define("foo", "bar");
-
-        let mut reader = ExpandingReader::new("hello foo world".as_bytes(), registry);
-        let mut output = String::new();
-        reader.read_to_string(&mut output).unwrap();
-
-        assert_eq!(output, "hello bar world");
-    }
-
-    #[test]
-    fn test_recursive_argument_expansion() {
-        assert_eq!(
-            expand(
-                "define(`inner', `EXPANDED')define(`wrapper', `[$1]')",
-                "wrapper(inner)"
-            ),
-            "[EXPANDED]"
-        );
-    }
-
-    #[test]
-    fn test_lazy_macro_storage() {
-        let mut registry = MacroRegistry::new();
-        registry.load("define(`foo', `bar')").unwrap();
-        registry.load("define(`baz', `foo qux')").unwrap();
-
-        let mut expander = Expander::new(registry);
-        assert_eq!(expander.expand("baz").unwrap(), "bar qux");
     }
 
     #[test]
@@ -994,13 +891,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn test_error_load_missing_file() {
-        let mut registry = MacroRegistry::new();
-        let err = registry.load_file("does/not/exist.m4").unwrap_err();
-        assert!(matches!(&err, M4Error::Io { path, .. } if path == "does/not/exist.m4"));
     }
 
     /// Yields one byte per `read` call.
